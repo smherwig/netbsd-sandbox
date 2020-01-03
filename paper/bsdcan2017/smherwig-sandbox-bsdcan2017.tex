@@ -1,0 +1,512 @@
+\documentclass[letterpaper,twocolumn,9pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{csquotes}
+\usepackage[english]{babel}
+\usepackage{usenix,epsfig,endnotes}
+
+\usepackage[backend=biber]{biblatex}
+\addbibresource{smherwig-sandbox-bsdcan2017.bib}
+
+\begin{document}
+
+%don't want date printed
+\date{}
+
+%make title bold and 14 pt font (Latex default is non-bold, 16 pt)
+\title{\bf secmodel\_sandbox : An application sandbox for NetBSD}
+
+%for single author (just remove % characters)
+\author{
+{\rm Stephen Herwig} \\
+University of Maryland, College Park
+} % end author
+
+\maketitle
+
+% Use the following at camera-ready time to suppress page numbers.
+% Comment it out when you first submit the paper for review.
+\thispagestyle{empty}
+
+% - remove abstract from title
+% - add section headers
+% - add a section that provides an overview of kauth(9) and secmodel(9).
+%
+% The LWC paper has the format:
+%   Abstract (2 paragraphs)
+%   Introduction        do
+%   Related Work        do, possibly merge into introduction
+%   NetBSD Background   Try to keep this section small
+%   Design              this is like your sandbox API
+%   Implementation      can have a section on kaut background here 
+%   Evaluation          instead, talk about applications
+%   Conclusions         
+%   Acknowledgements    save for last version
+
+
+\subsection*{Abtract}
+We introduce a new security model for NetBSD -- secmodel\_sandbox -- that
+allows per-process policies for restricting privileges.   Privileges correspond to
+kauth authorization requests, such as a request to create a socket or read a
+file, and policies specify the sandbox's decision: deny, defer, or allow.
+Processes may apply multiple sandbox policies to themselves, in which case the
+policies stack, and child processes inherit their parent's sandbox.  Sandbox
+policies are expressed in Lua, and the evaluation of policies uses NetBSD 7's
+experimental in-kernel Lua interpreter.  As such, policies may express static
+authorization decisions, or may register Lua functions that secmodel\_sandbox
+invokes for a decision.
+
+\section{Introduction}
+A process sandbox is a mechanism for limiting the privileges of a process, as
+in restricting the operations the process may perform, the resources it may
+use, or its view of of the system.  Sandboxes address the dual problems of
+limiting the potential damage caused by running an untrusted binary, and
+mitigating the effects of exploitation of a trusted binary.  In either case,
+the goal is to restrict a process to only the necessary privileges for the
+purported task, and, in the latter case, to also drop privileges when they are
+no longer needed.
+
+% a comment on the strengths and weaknesses of theses tools (both technical and
+% non-technical) -- e.g., TOCTOU
+Although NetBSD currently lacks a sandbox mechanism, sandbox implementations
+exist for various operating systems.  systrace \cite{SystracePaper}, a
+multi-platform mechanism used in earlier versions of NetBSD, and
+seccomp \cite{SeccompOverview}, a Linux-specific implementation,
+exemplify the approach of specifying a per-process system call policy, and use
+system call interposition to enforce the policy filter.  For systrace, the
+policy format is systrace-specific, whereas seccomp specifies the policy as a
+BPF program.  OpenBSD's pledge system call \cite{PledgeManpage} offers a
+simplified interface for dropping privileges: OpenBSD groups the POSIX
+interface into categories, and allows processes to whitelist or \emph{pledge}
+their use of certain categories; an attempt to perform an operation from a
+non-pledged category kills the process.  
+
+We implement an application sandbox for NetBSD, secmodel\_sandbox, that allows
+per-process restriction of privileges.  secmodel\_sandbox plugs into the kauth
+framework, and uses NetBSD's support for in-kernel Lua
+\cite{ScriptableOperatingSystems} to both specify and evaluate sandbox
+policies.  We are developing several facilities with secmodel\_sandbox, such as
+a secure chroot and a partial emulation of OpenBSD's pledge system call.
+
+\section{NetBSD Overview} 
+
+\subsection{kauth}
+NetBSD 4.0 introduced the kauth kernel subsystem
+\cite{NetBSDSecurityEnhancements} -- a clean room implementation of Apple's
+kauth framework \cite{MacKauth} for OS X -- to handle authorization requests
+for privileged operations.  Privileged operations are represented as triples of
+the form \emph{(scope, action, optional subaction)}.  The predefined scopes are
+\texttt{system}, \texttt{process}, \texttt{network}, \texttt{machdep},
+\texttt{device}, and \texttt{vnode}, each forming a namespace that is further
+refined by the action and subaction components.  For instance, the operation
+to create a socket is identified by the triple \texttt{(network, socket,
+open)}, and the operation to read a file by \texttt{(vnode, read\_data)}.   
+
+Some authorizations, such as \texttt{(process, nice)}, are triggered by a single
+system call (setpriority); some, such as \texttt{(system, mount, update)}, are
+triggered when a system call (mount) is called with specific arguments (the
+\texttt{MNT\_UPDATE} flag); and others, such as \texttt{(system, filehandle)}
+may be triggered by more than one system call (fhopen and fhstat).  Many system
+calls do not trigger a kauth request.
+
+kauth uses an observer pattern whereby listeners register for operation
+requests for a given scope; when a request occurs, each listener is called.
+
+Each listener receives as arguments the operation triple, the
+credentials of the object (typically, the process) that triggered the
+authorization request, as well as additional context specific to the
+request.
+
+Each listener returns a decision: either \texttt{allow},  \texttt{deny}, or
+\texttt{defer}.  If any listener returns \texttt{deny}, the request is denied.
+If at least one listener returns \texttt{allow} and none returns \texttt{deny},
+the request is allowed.  If all listeners return \texttt{defer}, the decision
+is scope-dependent.  For all scopes other than the vnode scope, the result is
+to deny the authorization.  For the vnode scope, the authorization request
+contains a ``fall-back" decision, which nearly always specifies a decision
+conforming to traditional BSD4.4 file access permissions.
+
+\subsection{secmodel}
+While the NetBSD kernel source contains many listeners (typically in accordance
+with kernel configuration options), the secmodel framework offers a lightweight
+convention for developing and managing a set of listeners that represents a
+larger security model.  By default, NetBSD uses secmodel\_bsd44, which
+implements the traditional security model based on 4.4BSD, and which itself is
+composed of three separate models: secmodel\_suser, secmodel\_securelevel, and
+secmodel\_extensions.
+
+An important, subtle point with the default security model is that many
+authorization requests are deferred, relying on kauth's default behavior when
+all listeners return \texttt{defer} to fully implement the policy.  
+
+\section{Design}
+We developed secmodel\_sandbox as a loadable kernel module with companion
+user-space library \texttt{libsandbox}.  By convention, we install the device
+file for secmodel\_sandbox at \texttt{/dev/sandbox}.
+
+A process interacts with secmodel\_sandbox via the \texttt{sandbox(const char
+*script, int flags)} function of \texttt{libsandbox}.  The argument
+\texttt{script} is a Lua script that specifies the sandbox policy.  The
+\texttt{flag} argument specifies the action to take when a process attempts a
+denied operation: a value of \texttt{0} means that the operation returns an
+appropriate errno as dictated by kauth (typically \texttt{EACCES} for
+kauth's vnode scope and \texttt{EPERM} for all other scopes); a value of
+\texttt{SANDBOX\_ON\_DENY\_KILL} specifies the pledge behavior of killing
+the process.  The \texttt{sandbox} function packages these arguments into a
+struct and, via an ioctl call, passes the struct to \texttt{/dev/sandbox}.
+
+secmodel\_sandbox evaluates the Lua script in a Lua environment that is
+pre-populated with a \texttt{sandbox} Lua module.  The \texttt{sandbox} Lua
+module allows a script to set policy rules via the following interface:
+
+\begin{verbatim}
+  sandbox.default(result)
+  sandbox.allow(req)
+  sandbox.deny(req)
+  sandbox.on(req, func)
+\end{verbatim}
+
+The \texttt{sandbox.default} function specifies a result of either
+\texttt{`allow'}, \texttt{`deny'}, or \texttt{`defer'}.  The result is the
+sandbox's decision for any kauth request for which the script does not specify
+a more specific rule.
+
+The \texttt{sandbox.allow} and \texttt{sandbox.deny} specify allow and deny
+rules, respectively, for the kauth request given as \texttt{req}.  
+
+The sandbox Lua module uses strings of the form
+\texttt{`scope.action.subaction'} to represent the requests; hence, a request
+to open a socket corresponds to the string \texttt{`network.socket.open'}, and
+a request to read a file to \texttt{`vnode.read\_data'}.  A script may specify a
+complete request name, or a prefix.  When the process triggers an authorization
+request, secmodel\_sandbox will select the policy rule that has the longest
+prefix match with the given request.  As an example, a sandbox policy script
+of:
+\begin{verbatim} 
+  sandbox.default(`deny') 
+  sandbox.allow(`network')
+\end{verbatim} 
+would allow any request in the network scope, but would deny requests from all
+other scopes.
+
+The \texttt{sandbox.on} Lua function registers a Lua function \texttt{func} to
+be called for the given kauth request.  The signature for \texttt{func} is:
+\begin{verbatim}
+  func(req, cred, arg0, arg1, arg2, arg3)
+\end{verbatim}
+where \texttt{req} is the kauth request that generated the callback, cred is a
+Lua table that represents the credentials of the requesting object or process,
+and the remaining arguments are request-specific.  All parameters for
+\texttt{func} exist only in the Lua environment; manipulating the values does
+not affect the underlying C objects that they represent.
+
+For many requests, the values for \texttt{arg0} through \texttt{arg3} are
+\texttt{nil}, as the kauth request carries no additional context.  For the
+requests that do contain context, we translate the context into appropriate Lua
+values.  For example, for the request \texttt{`network.socket.open'}, the
+arguments are Lua integers representing the arguments to the \texttt{socket}
+system call that triggered the request.  For clarity in script writing, we
+pre-populate the \texttt{sandbox} Lua module with symbols for common constants,
+such as \texttt{sandbox.AF\_INET} and \texttt{sandbox.SOCK\_STREAM}.\  For
+requests in the process scope, \texttt{arg0} is a Lua table that represents a
+subset of the fields of the \texttt{struct proc} that is the target of the
+request, such as the \texttt{pid}, \texttt{ppid}, \texttt{comm} (program name),
+and \texttt{nice} value.  Callback functions for the vnode scope receive as
+\texttt{arg0} a Lua table that contains the pathname and file status
+information of the target vnode.  Completely representing the context with Lua
+values is an ongoing effort.
+
+\section{Sandbox Implementation}
+% TODO: provide an introduction to the rest of the section here that explains
+% the main tricks or surprises that informed the implementation.
+%
+%   1. efficiency - having a ruleset rather than searching in Lua every time
+%   2. allowing rules to be dynamic - in effect, for the sandbox.on function
+%       to create new rules during its evaluation.
+%   3. minding the subtelies of the default secuirty model so as not to
+%      accidentally elevate privileges.
+%   5. additional safegurads to ensure that sandboxes are isolated (and hence,
+%      cannot be undone).
+%   4. changing/extending the normal behavior of fork in order to ensure that
+%      sandboxes are inherited, but that parent and child continue to add new
+%      sandboxes independent of the other.
+
+Our design and implementation of secmodel\_sandbox considered several important
+requirements and features.  First, while expressing rules in Lua is elegant,
+having to call into Lua to find a matching rule for each request is not.  Thus,
+we implemented secmodel\_sandbox so thatevaluating the policy script
+``compiles'' the rules into a prefix tree, mimicking the natural hierarchy
+provided by the (scope, action, subaction) format of requests.  Thus,
+secmodel\_sandbox can quickly find a matching rule, and only needs to call
+into Lua for \emph{functional} rules -- rules specified as Lua functions via
+\texttt{sandbox.on}.
+
+Second, we wanted to allow sandboxes to be \emph{dynamic}; that is, allow a
+functional rule to set other rules.  For example, a script might create rules
+based on the requesting credential, as in the following, which installs a
+functional rule for the network scope so that different rules may be created
+for the root user and for ordinary users:
+\begin{verbatim}
+  sandbox.on(`network', function(rule, cred)
+    if cred.euid == 0 then
+        sandbox.allow(`network.bind')
+        ...
+    else
+        sandbox.deny(`network.bind')
+        ...
+    end
+  end)
+\end{verbatim}
+
+Third, we had to be mindful of the subtleties of the default security model,
+particularly its dependency on kauth's default decisions when all listeners
+return defer, so as not to allow sandboxes to elevate a process's privileges
+beyond the default model.  In a similar vein, we needed to isolate multiple
+sandboxes on a single process so that the process is not able to install a new
+sandbox that loosens or undoes a rule of an existing sandbox.
+
+Finally, in order to ensure that child processes inherit the sandboxes of their
+parent, but that, after process creation, parent and child may apply additional
+sandboxes independently of one another, we had to extend the normal forking
+behavior.
+
+\subsection{Sandbox creation}
+When a process sets a sandbox policy via \texttt{libsandbox}, the kernel
+creates a new sandbox, represented as a \texttt{struct sandbox}. A sandbox
+contains two main items: a Lua state and a ruleset.  The Lua state is the Lua
+environment in which secmodel\_sandbox evaluates all Lua code for that
+particluar sandbox.  The ruleset is a prefix tree that secmodel\_sandbox
+searches during a kauth request to find the sandbox's matching rule. 
+
+Before secmodel\_sandbox evaluates the policy script in the newly created Lua
+state, secmodel\_sandbox adds the sandbox Lua functions (e.g.,
+\texttt{sandbox.allow}) and constants (e.g., \texttt{sandbox.AF\_INET}) to the
+state.  Each sandbox Lua function is a closure that contains a pointer to the
+\texttt{struct sandbox}.  In Lua terminology, the \texttt{struct sandbox }is a
+light userdata upvalue.  
+
+When the script calls a sandbox Lua function, the function -- which is
+implemented in C code -- performs argument checking, retrieves the ruleset from
+the \texttt{struct sandbox} upvalue, and inserts the rule and the rule's value
+into the ruleset.  
+
+For \texttt{sandbox.allow}, \texttt{sandbox.deny}, and
+\texttt{sandbox.default}, the rule's value is a trilean: one of
+\texttt{KAUTH\_RESULT\_ALLOW}, \texttt{KAUTH\_RESULT\_DENY}, or
+\texttt{KAUTH\_RESULT\_DEFER}, as defined in \texttt{sys/kauth.h}.  For
+\texttt{sandbox.on}, the value is an index into Lua's registry.  The Lua
+registry is a global table that can only be accessed from C code.  When a
+script invokes \texttt{sandbox.on}, secmodel\_sandbox stores the callback
+function at an unused index in the Lua registry, and the ruleset stores this
+index as the rule's value.
+
+After evaluating the policy script, secmodel\_sandbox attaches the
+\texttt{struct sandox} to the current process's credentials.  The data that
+secmodel\_sandbox attaches to a credential is in fact a list of \texttt{struct
+sandbox}'s, to support allowing a process to apply multiple sandboxes during
+the course of its execution.  If the list does not exist, secmodel\_sandbox
+first creates it and inserts the new sandbox; otherwise, the new \texttt{struct
+sandbox} is added to the existing list.
+
+Storing \texttt{struct sandbox} as an upvalue supports the creation of
+dynamic rules; that is, a \texttt{sandbox.on} callback function that
+creates rules for other requests as part of its evaluation.  If the callback
+function creates new rules by calling any of the \texttt{sandbox} Lua module
+functions, then the C implementations of these functions can immediately find
+the corresponding ruleset for the given Lua state.
+
+\subsection{Evaluating Authorization Requests}
+% XXX we might need to call kauth_cred_setdata in the lua C-functions.
+secmodel\_sandbox registers listeners for all kauth scopes.  When one of the
+secmodel\_sandbox listeners is called, the listener checks whether a list of
+\texttt{struct sandbox}s is attached to the requesting credential.  If a list
+is not attached, the listener defers; if a list is attached, secmodel\_sandbox
+searches the ruleset of each \texttt{struct sandbox} for a value, calling into
+Lua if the value represents a registry index for a callback function.   
+
+If any sandbox in the list returns \texttt{deny}, secmodel\_sandox returns deny
+for the request; if at least one sandbox returns \texttt{allow} and none
+returns \texttt{deny}, secmodel\_sandbox returns \texttt{defer}, not
+\texttt{allow} as one would presume.  The reason for ``converting"
+\texttt{allow} to \texttt{defer} is due to subtleties in the implementation of
+kauth(9) and of the default security models that implement the traditional
+BSD4.4 security policy.  In particular, since a large part of the traditional
+security model is implemented by having all listeners defer, and thus relying
+on kauth's ``fall-back" behavior, secmodel\_sandbox must also defer, so as not
+to allow the elevation of privileges.
+
+\subsection{Process forking}
+% sys/kern/kern_fork.c::sys_fork
+%   sys/kern/kern_fork.c::fork1
+%       sys/kern/kern_auth.c::kauth_proc_fork
+In NetBSD, a process's credentials are represented by the
+\texttt{kauth\_cred\_t} type.  The kauth framework emits events
+corresponding to a credential's life-cycle via the \texttt{cred} scope.  As with
+other kauth scopes, listeners may register callback functions.
+
+When a process forks, the normal behavior is for the parent and child to share
+the same \texttt{kauth\_cred\_t}, and to simply increment the credential's
+reference count.  During the fork process, however, the kauth framework
+emits a \texttt{fork} event, thereby allowing for other behavior.  For the
+\texttt{fork} event, the listener callback functions receive the \texttt{struct
+proc} of the parent and child, as well as the shared credential.
+
+secmodel\_sandbox registers a callback for credential events.  During a
+\texttt{fork} event, secmodel\_sandbox checks whether the credential contains a
+list of sandboxes.  If yes, then secmodel\_sandbox creates a new credential for
+the child process that is identical to the parent's credential, with the
+exception that the child credential contains a new list head for the list of
+sandboxes.  Althought the list head of the parent and child are different, they
+both point to the same initial \texttt{struct sandbox}.  Thus, each sandboxed
+process has its own \texttt{kauth\_cred\_t} and its own sandbox list head, but
+the individual \texttt{struct sandbox}s are shared among the related processes,
+and hence reference counted.
+
+% add footnote
+The handling of sandboxes in this manner means that the child is restricted by
+the same sandboxes as its parent at the time of the child's creation, but that
+after the child's creation, parent and child may add additional sandbox
+policies that do not affect the other process.
+
+\subsection{Mapping vnodes to pathnames}
+The request context for the the \texttt{vnode} kauth scope contains the vnode
+that is the target of the operation.  For a sandbox policy, however, it is much
+more natural to work with pathnames rather than vnodes.
+
+secmodel\_sandbox uses methods similar to those in
+\texttt{sys/kern/vfs\_getcwd.c} to attempt to retrieve a pathname.  The method
+is to search for the basename of the vnode in the \texttt{namei} cache via
+\texttt{cache\_revlookup}, and then walk back to the root vnode via
+interspersing calls to \texttt{VOP\_LOOKUP} (to retrieve a parent vnode),
+and \texttt{VOP\_READDIR} (to find the path name component of the child
+vnode).   While we would expect the initial vnode to be present in the cache,
+an obvious weakness of this method is the reliance on a cache hit, which cannot
+be gauranteed.
+
+\subsection{Safeguards}
+Evaluating user-provided Lua scripts in the kernel raises a few concerns.  An
+obvious concern is denial-of-service caused by a Lua script with an infinite
+loop.  While not yet implemented, the defense is straight-forward, and
+used in the Lua kernel module to handle creating Lua states with \texttt{luactl}.
+
+In short, as part of its C API, Lua provides the function
+\texttt{lua\_sethook} for an application to register a C hook function
+to be called at various Lua VM events.  In particular, an application
+can register to receive a callback after every $n$ Lua VM instructions.  The
+approach is therefore to set a hook function to be called after some maximum
+number of VM instructions; if the hook is called, the hook stops execution of the
+Lua VM by calling \texttt{lua\_error}.  Lua allows only one hook function per
+Lua state; in order to ``restore'' the VM instruction count back to zero, the
+hook function must be reset before every evaluation of a Lua script or
+function.
+
+Another concern is that the \texttt{struct sandbox}s or the callbacks
+registered via \texttt{sandbox.on} might be accessed and modified from Lua
+code.  Values in the Lua registry and upvalues are, provided Lua's
+\texttt{debug} library is not loaded, only accessible from C code.
+secmodel\_sandbox does not load the \texttt{debug} library.  Moreover,
+secmodel\_sandbox does not provide a \texttt{require} function or any other
+means to load additional Lua libraries.
+
+\section{Applications}
+In this section, we describe the tools and facilities we are developing with
+secmodel\_sandbox.
+
+\subsection{Secure chroot}
+One application that we are developing is a secure chroot.  In 2011, Aleksey
+Cheusov proposed the secmodel\_securechroot security model
+\cite{SecmodelSecureChroot}.  secmodel\_securechroot was developed as a kernel
+module, and once loaded, modifies the chroot system call to place additional
+restrictions on the chrooted process.  The restrictions impose process
+containment by preventing process's with one root directory from viewing
+information about processes with a different root directory, as well as denying
+the chrooted process several system-wide operations, such as rebooting,
+modifying sysctls, or adding devices. 
+
+On NetBSD's \texttt{tech-kern} mailing list, there was disagreement over the
+exact operations that should be allowed and denied within a secure chroot.
+Moreover, some users expressed a desire to not override the default
+\texttt{chroot} behavior, but rather have an additional system call for secure
+chroot, so that users could choose the level of restriction for each chrooted
+process.  While some of the changes to kauth needed to support
+\texttt{secmodel\_sandbox} were merged into the NetBSD kernel source, the
+secmodel itself was not.
+
+We are developing an implementation of secmodel\_securechroot as an auxiliary
+function, \texttt{sandbox\_securechroot}, in \texttt{libsandbox}, with an
+associated command-line tool.  Development of the tool demonstrates that
+previously proposed secmodels can be implemented using secmodel\_sandbox, and
+that secmodel\_sandbox offers users flexibility in choosing the proper level of
+containment.
+
+%In 2008, the Gaols project \cite{GaolsPaper} attempted to implement FreeBSD's jail
+%facility in NetBSD using the kauth(9) framework.  The project stressed
+%the limits of kauth(9), and required a number of modifications to kauth(9).
+%The more interesting changes involved allowing the binding of a socket to only
+%an approved list of addresses for the specific jail. in paritcular replacing
+%certain newtork addresses with an address from the list of local network
+%addresses permitted in the prision.  When an imporsioned process reqeust to
+%bind a socket to the unspecified orloopback address, or tries to connect othe
+%loopback address, the jail code needs to fix up the address with an address
+%form the list of local network addresses permitted in the jail.
+
+\subsection{pledge}
+% one small exception is wpath's fstat()
+We are also developing the \texttt{libsandbox} auxiliary function
+\texttt{sandbox\_pledge}, which  attempts to emulate OpenBSD's pledge system
+call using secmodel\_sandbox.
+
+A sandbox policy that mimics pledge is essentially a whitelist: explicitly
+allowing actions that correspond to a given category, and denying all others.
+Certain categories are easily implemented.  For instance, the pledge
+categories that correspond to the access and modification of file metadata,
+such as \texttt{rpath}, \texttt{wpath}, \texttt{fattr}, and \texttt{chown},
+are, with small exceptions, handled by appropriate \texttt{vnode} scope rules.
+Similarly, categories that limit network access to certain domains, such as
+\texttt{inet} and \texttt{unix}, are covered by rules for
+\texttt{`network.bind'} and \texttt{`network.socket.open'}.
+
+Several pledge categories, however, reference system calls that, in NetBSD, do
+not trigger kauth requests.  For example, the \texttt{flock} category that
+allows file locking or the \texttt{dns} category that allows DNS network
+transactions, lack apprporiate kauth requests.  As a result such categories
+cannot be implemented.
+
+\section{Conclusion}
+% Reiterate what you have done?
+% What have you shown?
+% What was hard?
+% What do you think will be easy?
+% What is the advantage of this?
+We have introduced and developed a new security model, secmodel\_sandbox, for
+NetBSD that allows per-process specification and restriction of privileges.
+While several secmodels exist for NetBSD, secmodel\_sandbox is novel in its use
+of NetBSD's in-kernel Lua interpreter to allow processes to express privileges,
+subject to the bounds of the traditional BSD4.4 security model.  We designed
+secmodel\_sandbox to limit excessive calls into Lua, to allow sandboxes to
+dynamically create rules during the execution of a process, to allow a process
+to specify multiple, isolated, sandboxes during the course of its execution,
+and to ensure that a child process inherits the sandbox of its parent.  We are
+developing concrete, familiar, applications in order to demonstrate our
+design's ease and flexibility in developing secure software.
+
+
+% FUTURE WORK
+% ===========
+% using fileassoc() and veriexec() to attach sandbox policies to executables
+% implementing secmodel_rbac
+%
+% perhaps mention that in a later section you will comment on what can be done 
+% if changes to the system are allowd.
+
+% sandbox_device.c::sandbox_device_setspec
+%   sandbox.c::sandbox_attach
+%       kern_auth.c::kauth_cred_getdata
+%       sandbox.c::sandbox_create
+%           sandbox_ruleset.c::sandbox_ruleset_create
+%           sandbox_lua.c::sanbox_lua_newstate
+%           sandbox_lua.c::sandbox_lua_load
+%       either secmodel_sandbox_attachcurproc, or kauth_cred_setdata
+
+\printbibliography
+
+\end{document}
