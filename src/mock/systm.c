@@ -1,9 +1,10 @@
+/* $NetBSD: copy.c,v 1.7 2012/01/14 17:42:52 reinoud Exp $ */
+
 /*-
- * Copyright (c) 2020 The NetBSD Foundation, Inc.
+ * Copyright (c) 2007 Jared D. McNeill <jmcneill@invisible.ca>
  * All rights reserved.
  *
- * This code is derived from software contributed to The NetBSD Foundation
- * by 
+ * Minor changes by Stephen Herwig.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
